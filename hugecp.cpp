@@ -23,6 +23,10 @@ static_assert(sizeof(off_t) == 8);
 static_assert(HUGE_PAGE_SIZE == 1073741824);
 
 static char buffer[HUGE_PAGE_SIZE];
+static int64_t pageSize  = HUGE_PAGE_SIZE;
+static off_t srcSize = 0;
+static int64_t tgtSize = 0;
+static off_t totalCopySize = 0;
 
 void update_progress(int progress) {
     int bar_length = 40; // Modify this to change the bar's length
@@ -56,8 +60,9 @@ bool copyOneFile(const char *fileName, off_t fileSize, off_t pageSize, char *ptr
             (size > 0 && i == pageNumber - 1)) {
             memcpy(ptr, buffer, size);
             ptr += pageSize; // last page no need to worry
-            update_progress(i * 100 / pageNumber);
             copySize += size;
+            totalCopySize += size;
+            update_progress(totalCopySize * 100 / tgtSize);
         } else {
             if (size == -1) {
                 printf("read source file %s failed with error %s\n", fileName, strerror(errno));
@@ -72,18 +77,17 @@ bool copyOneFile(const char *fileName, off_t fileSize, off_t pageSize, char *ptr
             }
         }
     }
-    printf("file %s size %lu copied %lu %s\n", fileName, fileSize, copySize, result?"success":"failure");
+    // printf("file %s size %lu copied %lu %s\n", fileName, fileSize, copySize, result?"success":"failure");
     return result;
 }
 
-bool openDirectory(const char* dirName, map<string, off_t>& filesInfo, off_t& totalSize) {
+bool openDirectory(const string& dirName, map<string, off_t>& filesInfo, off_t& totalSize) {
     bool result = true;
-    totalSize = 0;
 
-    DIR* dir = opendir(dirName);
+    DIR* dir = opendir(dirName.c_str());
     
     if (!dir) {
-        printf("directory %s cannot be opened %s\n", dirName, strerror(errno));
+        printf("directory %s cannot be opened %s\n", dirName.c_str(), strerror(errno));
         return false;
     }
 
@@ -93,12 +97,13 @@ bool openDirectory(const char* dirName, map<string, off_t>& filesInfo, off_t& to
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
         if (ent->d_type != DT_REG) continue; // don't support recursive
         struct stat st;
-        if (stat(ent->d_name, &st) != 0) {
-            printf("stat file %s failed %s\n", ent->d_name, strerror(errno));
+        string fileName = dirName + "/" + ent->d_name;
+        if (stat(fileName.c_str(), &st) != 0) {
+            printf("stat file %s failed %s\n", fileName.c_str(), strerror(errno));
             result = false;
             break;
         }
-        filesInfo.insert(make_pair(ent->d_name, st.st_size));
+        filesInfo.insert(make_pair(fileName, st.st_size));
         totalSize += st.st_size;   
     }
     closedir(dir);
@@ -116,26 +121,27 @@ int main(int argc, char **argv) {
         printf("source file %s is not valid file: %s\n", argv[1], strerror(errno));
         return -2;
     }
-    off_t srcSize = 0;
     map<string, off_t> filesInfo;
-    if (st.st_mode == S_IFREG) {
+    if (S_ISREG(st.st_mode)) {
+        printf("copy mode for single model file %s\n", argv[1]);
         srcSize = st.st_size;
         filesInfo.insert(make_pair(argv[1], st.st_size));
-    } else if (st.st_mode == S_IFDIR) {
+    } else if (S_ISDIR(st.st_mode)) {
+        printf("copy mode for directory model file %s\n", argv[1]);
         if (!openDirectory(argv[1], filesInfo, srcSize)) {
             printf("collect source directory files info failed!\n");
             return -6;
         }
     }
-    int64_t pageSize = HUGE_PAGE_SIZE;
     // target size for mmap must be aligned with pageSize;
-    int64_t tgtSize = (srcSize + pageSize - 1) / pageSize * pageSize;
+    tgtSize = (srcSize + pageSize - 1) / pageSize * pageSize;
     int tgtFd;  
     tgtFd = open(argv[2], O_CREAT | O_RDWR | O_EXCL, 0666);
     if (tgtFd == -1) {
         printf("target file %s cannot be opened! %s\n", argv[2], strerror(errno));
         return -6;
     }
+    printf("prepare to mmap target size %lu for source size  %lu\n", tgtSize, srcSize);
     void *ptr = mmap(NULL, tgtSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB, tgtFd, 0);
     if (ptr == MAP_FAILED) {
         printf("mmap target file %s failed %s", argv[2], strerror(errno));
@@ -143,7 +149,7 @@ int main(int argc, char **argv) {
     }
     close(tgtFd); // immediately close is better
     char *tgtPtr = (char *)ptr;
-    off_t totalCopySize = 0;
+
     bool result = true;
     // we have to assume all model files's name must be alphabetical ordered
     for (auto it = filesInfo.begin(); it != filesInfo.end(); it ++) {
@@ -152,8 +158,7 @@ int main(int argc, char **argv) {
             break;
         }
         tgtPtr += it->second;
-        totalCopySize += it->second;
-        update_progress(totalCopySize * 100 / tgtSize);
+        // update_progress(totalCopySize * 100 / tgtSize);
     }
    
     printf("\n%s copy from %s to target %s of total size %lu finished %ld\n", result?"Succeed":"Failed", 
