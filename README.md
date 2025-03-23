@@ -18,3 +18,10 @@ Instead it uses **hugetlbfs**, a RAM-backed filesystem.
 * **When**
 Using this tool only when you have sufficient memory. i.e. I have no GPU, but huge memory like 1.5T
 
+
+* **Updates**
+    ```
+        -  Mar 24, 2025 now accept source as directory name which means all models under directory will be concatenated.
+    
+    ```
+
