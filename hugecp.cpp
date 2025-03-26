@@ -9,18 +9,20 @@
 #include <dirent.h>
 #include <map>
 #include <string>
+#include <getopt.h>
 
 using namespace std;
 
 extern int errno;
 
-#ifndef HUGE_PAGE_SIZE
-#define HUGE_PAGE_SIZE 1073741824 // 2097152
-#endif
-
+#ifdef HUGEPAGE_SIZE_1G
+#define HUGE_PAGE_SIZE 1073741824
 //  sanity test
 static_assert(sizeof(off_t) == 8);
 static_assert(HUGE_PAGE_SIZE == 1073741824);
+#else
+#define HUGE_PAGE_SIZE 2097152
+#endif
 
 static char buffer[HUGE_PAGE_SIZE];
 static int64_t pageSize  = HUGE_PAGE_SIZE;
@@ -111,24 +113,61 @@ bool openDirectory(const string& dirName, map<string, off_t>& filesInfo, off_t& 
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        printf("usage: %s <srcFile|srcDirectory> tgtFile\n", argv[0]);
-        return -1;
+    bool verbose_flag = false;
+    struct option long_options[] = {
+        {"verbose", no_argument, 0, 'v'},
+        {"source", required_argument, 0, 'i'},
+        {"target", required_argument, 0, 'o'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0} // Required terminator
+    };
+    const char* help = "[--verbose] <-i sourceFilename|sourceDirectory > <-o targetFilename> [--help]";
+
+     // Check for no arguments or just program name
+     if (argc <= 1) {
+        fprintf(stderr, "Error: -o and -i options are required.\n");
+        printf("Usage: %s %s\n", argv[0], help);
+        return 1;
     }
+    char* srcNamePtr = nullptr, *tgtNamePtr = nullptr;
+    int option_index = 0;
+    int opt;
+    while ((opt = getopt_long(argc, argv, "hvo:i:", long_options, &option_index)) != -1) {
+        switch (opt) {
+            case 'v':
+                verbose_flag = true;
+                break;
+            case 'i':
+                srcNamePtr = optarg;
+                break;
+            case 'o':
+                tgtNamePtr = optarg;
+                break;
+            case 'h':
+                printf("Usage: %s %s\n", argv[0], help);
+                return 0;
+            case '?':
+                /* getopt_long already printed an error message. */
+                return 1;
+            default:
+                abort();
+        }
+    }
+
     struct stat st;
 
-    if (stat(argv[1], &st) != 0) {
-        printf("source file %s is not valid file: %s\n", argv[1], strerror(errno));
+    if (stat(srcNamePtr, &st) != 0) {
+        printf("source file %s is not valid file: %s\n", srcNamePtr, strerror(errno));
         return -2;
     }
     map<string, off_t> filesInfo;
     if (S_ISREG(st.st_mode)) {
-        printf("copy mode for single model file %s\n", argv[1]);
+        printf("copy mode for single model file %s\n", srcNamePtr);
         srcSize = st.st_size;
-        filesInfo.insert(make_pair(argv[1], st.st_size));
+        filesInfo.insert(make_pair(srcNamePtr, st.st_size));
     } else if (S_ISDIR(st.st_mode)) {
-        printf("copy mode for directory model file %s\n", argv[1]);
-        if (!openDirectory(argv[1], filesInfo, srcSize)) {
+        printf("copy mode for directory model file %s\n", srcNamePtr);
+        if (!openDirectory(srcNamePtr, filesInfo, srcSize)) {
             printf("collect source directory files info failed!\n");
             return -6;
         }
@@ -136,21 +175,25 @@ int main(int argc, char **argv) {
     // target size for mmap must be aligned with pageSize;
     tgtSize = (srcSize + pageSize - 1) / pageSize * pageSize;
     int tgtFd;  
-    tgtFd = open(argv[2], O_CREAT | O_RDWR | O_EXCL, 0666);
+    tgtFd = open(tgtNamePtr, O_CREAT | O_RDWR | O_EXCL, 0666);
     if (tgtFd == -1) {
-        printf("target file %s cannot be opened! %s\n", argv[2], strerror(errno));
+        printf("target file %s cannot be opened! %s\n", tgtNamePtr, strerror(errno));
         return -6;
     }
     printf("prepare to mmap target size %lu for source size  %lu\n", tgtSize, srcSize);
     void *ptr = mmap(NULL, tgtSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB, tgtFd, 0);
     if (ptr == MAP_FAILED) {
-        printf("mmap target file %s failed %s", argv[2], strerror(errno));
+        printf("mmap target file %s failed %s", tgtNamePtr, strerror(errno));
         return -7;
     }
     close(tgtFd); // immediately close is better
     char *tgtPtr = (char *)ptr;
 
     bool result = true;
+    printf("prepare to concatenate model files at following order:\n");
+    for (auto it = filesInfo.begin(); it != filesInfo.end(); it ++) {
+        printf("name: %s size: %lu\n", it->first.c_str(), it->second);
+    } 
     // we have to assume all model files's name must be alphabetical ordered
     for (auto it = filesInfo.begin(); it != filesInfo.end(); it ++) {
         if (!copyOneFile(it->first.c_str(), it->second, pageSize, tgtPtr)) {
@@ -162,7 +205,7 @@ int main(int argc, char **argv) {
     }
    
     printf("\n%s copy from %s to target %s of total size %lu finished %ld\n", result?"Succeed":"Failed", 
-        argv[1], argv[2], srcSize, totalCopySize);
+        srcNamePtr, tgtNamePtr, srcSize, totalCopySize);
     munmap(ptr, tgtSize);  
     return 0;
 }
