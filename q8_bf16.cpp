@@ -29,9 +29,9 @@ float bfloat16_to_float(bfloat16 bf) {
 }
 
 void update_progress(int progress) {
-  int bar_length = 40; // Modify this to change the bar's length
+  int bar_length = 40;
   int filled_length = (int)(bar_length * progress / 100.0);
-  char bar[bar_length + 1]; // +1 for the null terminator
+  char bar[bar_length + 1];
   for (int i = 0; i < bar_length; i++) {
     if (i < filled_length) {
       bar[i] = '=';
@@ -39,9 +39,9 @@ void update_progress(int progress) {
       bar[i] = '-';
     }
   }
-  bar[bar_length] = '\0'; // Null-terminate the string
+  bar[bar_length] = '\0';
   printf("\r[%s] %d%%", bar, progress);
-  fflush(stdout); // Ensure output is written immediately
+  fflush(stdout);
 }
 
 std::vector<bfloat16>
@@ -101,90 +101,20 @@ weight_dequant_cpu(const std::vector<uint8_t> &quantized_weight,
 }
 
 template <typename T>
-std::vector<T> load_tensor(const std::string &filename,
-                           const std::string &tensor_name,
-                           std::vector<long long> &shape) {
+std::vector<T> load_tensor_data(const std::string &filename, int64_t offset,
+                                size_t num_bytes) {
   std::ifstream file(filename, std::ios::binary);
   if (!file.is_open()) {
     std::cerr << "Error: Could not open file " << filename << std::endl;
     return {};
   }
-
-  uint64_t metadata_len;
-  if (!file.read(reinterpret_cast<char *>(&metadata_len),
-                 sizeof(metadata_len))) {
-    std::cerr << "Error reading metadata length from " << filename << std::endl;
+  file.seekg(offset, std::ios::beg);
+  std::vector<T> data(num_bytes / sizeof(T));
+  if (!file.read(reinterpret_cast<char *>(data.data()), num_bytes)) {
+    std::cerr << "Error reading " << num_bytes << " bytes from " << filename
+              << " at offset " << offset << std::endl;
     return {};
   }
-
-  std::string metadata_str(metadata_len, '\0');
-  if (!file.read(metadata_str.data(), metadata_len)) {
-    std::cerr << "Error reading metadata from " << filename << std::endl;
-    return {};
-  }
-
-  nlohmann::json metadata;
-  try {
-    metadata = nlohmann::json::parse(metadata_str);
-  } catch (const nlohmann::json::parse_error &e) {
-    std::cerr << "Error parsing JSON metadata in " << filename << ": "
-              << e.what() << std::endl;
-    return {};
-  }
-
-  if (!metadata.contains("__metadata__") || !metadata.contains(tensor_name)) {
-    std::cerr << "Error: Tensor '" << tensor_name
-              << "' not found in metadata of " << filename << std::endl;
-    return {};
-  }
-
-  auto tensor_info = metadata[tensor_name];
-  std::vector<long long> loaded_shape =
-      tensor_info["shape"].get<std::vector<long long>>();
-  std::string dtype_str = tensor_info["dtype"].get<std::string>();
-  std::vector<int64_t> data_offsets_array =
-      tensor_info["data_offsets"].get<std::vector<int64_t>>();
-  int64_t data_start = data_offsets_array[0];
-
-  shape = loaded_shape;
-  size_t tensor_num_elements = 1;
-  for (long long dim : shape) {
-    tensor_num_elements *= dim;
-  }
-  size_t element_size = 0;
-  if (dtype_str == "uint8" || dtype_str == "int8" || dtype_str == "F8_E4M3")
-    element_size = 1;
-  else if (dtype_str == "uint16" || dtype_str == "int16" ||
-           dtype_str == "bfloat16" || dtype_str == "BF16")
-    element_size = 2;
-  else if (dtype_str == "uint32" || dtype_str == "int32" ||
-           dtype_str == "float32" || dtype_str == "F32")
-    element_size = 4;
-  else if (dtype_str == "uint64" || dtype_str == "int64" ||
-           dtype_str == "float64")
-    element_size = 8;
-  else {
-    std::cerr << "Error: Unsupported data type '" << dtype_str
-              << "' for tensor '" << tensor_name << "'" << std::endl;
-    return {};
-  }
-
-  if (sizeof(T) != element_size) {
-    std::cerr << "Error: C++ data type size does not match tensor data type "
-                 "size for tensor '"
-              << tensor_name << "'" << std::endl;
-    return {};
-  }
-
-  file.seekg(data_start, std::ios::beg);
-  std::vector<T> data(tensor_num_elements);
-  if (!file.read(reinterpret_cast<char *>(data.data()),
-                 tensor_num_elements * sizeof(T))) {
-    std::cerr << "Error reading tensor data for '" << tensor_name << "' from "
-              << filename << std::endl;
-    return {};
-  }
-
   file.close();
   return data;
 }
@@ -212,16 +142,11 @@ int main(int argc, char *argv[]) {
 
   auto weight_map =
       model_index["weight_map"].get<std::map<std::string, std::string>>();
-  std::map<std::string,
-           std::tuple<std::vector<uint8_t>, std::vector<long long>>>
-      fp8_weights;
-  std::map<std::string, std::tuple<std::vector<float>, std::vector<long long>>>
-      float_weights;
-  std::map<std::string,
-           std::tuple<std::vector<bfloat16>, std::vector<long long>>>
-      bf16_weights;
-  std::map<std::string, std::tuple<std::vector<float>, std::vector<long long>>>
-      scale_inv_weights;
+  std::map<std::string, std::pair<std::vector<char>, std::vector<long long>>>
+      combined_data;
+  nlohmann::json new_metadata_json;
+  new_metadata_json["__metadata__"] = {{"format", "pt"}};
+  uint64_t current_offset = 0;
 
   std::vector<std::string> safetensor_files;
   for (const auto &entry : std::filesystem::directory_iterator(fp8_path)) {
@@ -231,111 +156,168 @@ int main(int argc, char *argv[]) {
   }
   std::sort(safetensor_files.begin(), safetensor_files.end());
 
-  std::cout << "begin reading " << safetensor_files.size()
+  std::cout << "Processing " << safetensor_files.size()
             << " safetensor files..." << std::endl;
-  int read_file_counter = 0;
+  int file_counter = 0;
   for (const auto &file_name : safetensor_files) {
-    update_progress((read_file_counter++) * 100 / safetensor_files.size());
+    update_progress((file_counter++) * 100 / safetensor_files.size());
     std::string safetensor_file_path = fp8_path + "/" + file_name;
+    std::ifstream infile(safetensor_file_path, std::ios::binary);
+    if (!infile.is_open()) {
+      std::cerr << "Error: Could not open file " << safetensor_file_path
+                << std::endl;
+      continue;
+    }
 
-    for (const auto &[weight_name, weight_in_file] : weight_map) {
-      if (weight_in_file == file_name) {
-        std::vector<long long> weight_shape;
-        if (weight_name.find("weight") != std::string::npos &&
-            !ends_with(weight_name, "_scale_inv")) {
-          std::vector<uint8_t> weight_data = load_tensor<uint8_t>(
-              safetensor_file_path, weight_name, weight_shape);
-          if (!weight_data.empty()) {
-            fp8_weights[weight_name] =
-                std::make_tuple(weight_data, weight_shape);
-          } else {
-            std::cerr << "Warning: Could not load FP8 weight " << weight_name
-                      << " in " << file_name << std::endl;
+    uint64_t metadata_len;
+    if (!infile.read(reinterpret_cast<char *>(&metadata_len),
+                     sizeof(metadata_len))) {
+      std::cerr << "Error reading metadata length from " << safetensor_file_path
+                << std::endl;
+      continue;
+    }
+    std::string metadata_str(metadata_len, '\0');
+    if (!infile.read(metadata_str.data(), metadata_len)) {
+      std::cerr << "Error reading metadata from " << safetensor_file_path
+                << std::endl;
+      continue;
+    }
+    nlohmann::json chunk_metadata;
+    try {
+      chunk_metadata = nlohmann::json::parse(metadata_str);
+    } catch (const nlohmann::json::parse_error &e) {
+      std::cerr << "Error parsing JSON metadata in " << safetensor_file_path
+                << ": " << e.what() << std::endl;
+      continue;
+    }
+
+    for (const auto &[local_tensor_name, tensor_info] :
+         chunk_metadata.items()) {
+      if (local_tensor_name == "__metadata__")
+        continue;
+
+      std::string global_tensor_name;
+      for (const auto &[global_name, file] : weight_map) {
+        if (file == file_name && global_name == local_tensor_name) {
+          global_tensor_name = global_name;
+          break;
+        }
+      }
+      if (global_tensor_name.empty())
+        continue;
+
+      std::string dtype_str = tensor_info["dtype"].get<std::string>();
+      std::vector<long long> shape =
+          tensor_info["shape"].get<std::vector<long long>>();
+      std::vector<int64_t> data_offsets =
+          tensor_info["data_offsets"].get<std::vector<int64_t>>();
+      int64_t data_start = data_offsets[0];
+      int64_t data_end = data_offsets[1];
+      size_t tensor_num_bytes = data_end - data_start;
+
+      if (ends_with(global_tensor_name, "_scale_inv")) {
+        continue; // Skip scale tensors
+      }
+
+      if (dtype_str == "F8_E4M3" &&
+          weight_map.count(global_tensor_name + "_scale_inv")) {
+        std::vector<uint8_t> quantized_data = load_tensor_data<uint8_t>(
+            safetensor_file_path, data_start, tensor_num_bytes);
+        std::vector<long long> scale_shape;
+        std::string scale_file = weight_map[global_tensor_name + "_scale_inv"];
+        // Assuming scale is in the same file for simplicity. Adjust if needed.
+        nlohmann::json scale_chunk_metadata;
+        std::ifstream scale_infile(fp8_path + "/" + scale_file,
+                                   std::ios::binary);
+        if (scale_infile.is_open()) {
+          uint64_t scale_metadata_len;
+          scale_infile.seekg(8, std::ios::beg);
+          if (scale_infile.read(reinterpret_cast<char *>(&scale_metadata_len),
+                                sizeof(scale_metadata_len))) {
+            std::string scale_metadata_str(scale_metadata_len, '\0');
+            if (scale_infile.read(scale_metadata_str.data(),
+                                  scale_metadata_len)) {
+              try {
+                scale_chunk_metadata =
+                    nlohmann::json::parse(scale_metadata_str);
+                if (scale_chunk_metadata.contains(global_tensor_name +
+                                                  "_scale_inv")) {
+                  auto scale_info =
+                      scale_chunk_metadata[global_tensor_name + "_scale_inv"];
+                  std::vector<int64_t> scale_offsets =
+                      scale_info["data_offsets"].get<std::vector<int64_t>>();
+                  int64_t scale_start = scale_offsets[0];
+                  int64_t scale_end = scale_offsets[1];
+                  size_t scale_num_bytes = scale_end - scale_start;
+                  std::vector<float> scale_inv_data =
+                      load_tensor_data<float>(fp8_path + "/" + scale_file,
+                                              scale_start, scale_num_bytes);
+                  if (!quantized_data.empty() && !scale_inv_data.empty() &&
+                      shape.size() == 2) {
+                    std::vector<bfloat16> bf16_data = weight_dequant_cpu(
+                        quantized_data, scale_inv_data, shape[0], shape[1]);
+                    size_t bf16_data_size = bf16_data.size() * sizeof(bfloat16);
+                    std::vector<char> char_data(
+                        reinterpret_cast<const char *>(bf16_data.data()),
+                        reinterpret_cast<const char *>(bf16_data.data()) +
+                            bf16_data_size);
+                    combined_data[global_tensor_name] = {char_data, shape};
+                    new_metadata_json[global_tensor_name] = {
+                        {"dtype", "BF16"},
+                        {"shape", shape},
+                        {"data_offsets",
+                         {current_offset, current_offset + bf16_data_size}}};
+                    current_offset += bf16_data_size;
+                  } else {
+                    std::cerr << "Warning: Could not dequantize "
+                              << global_tensor_name << std::endl;
+                  }
+                }
+              } catch (const nlohmann::json::parse_error &e) {
+                std::cerr << "Error parsing scale metadata: " << e.what()
+                          << std::endl;
+              }
+            }
           }
-        } else if (ends_with(weight_name, "_scale_inv")) {
-          std::string base_weight_name = weight_name.substr(
-              0, weight_name.length() - std::string("_scale_inv").length());
-          std::vector<float> scale_inv_data = load_tensor<float>(
-              safetensor_file_path, weight_name, weight_shape);
-          if (!scale_inv_data.empty()) {
-            scale_inv_weights[base_weight_name] =
-                std::make_tuple(scale_inv_data, weight_shape);
+          scale_infile.close();
+        }
+      } else if (dtype_str == "BF16" || dtype_str == "float32" ||
+                 dtype_str == "F32") {
+        std::vector<char> tensor_data(tensor_num_bytes);
+        infile.seekg(data_start, std::ios::beg);
+        if (infile.read(tensor_data.data(), tensor_num_bytes)) {
+          std::string target_dtype = "BF16";
+          std::vector<char> converted_data;
+          if (dtype_str == "float32" || dtype_str == "F32") {
+            std::vector<float> float_data(tensor_num_bytes / sizeof(float));
+            std::memcpy(float_data.data(), tensor_data.data(),
+                        tensor_num_bytes);
+            std::vector<bfloat16> bf16_data(float_data.size());
+            for (size_t i = 0; i < float_data.size(); ++i) {
+              bf16_data[i] = float_to_bfloat16(float_data[i]);
+            }
+            converted_data.assign(
+                reinterpret_cast<const char *>(bf16_data.data()),
+                reinterpret_cast<const char *>(bf16_data.data()) +
+                    bf16_data.size() * sizeof(bfloat16));
           } else {
-            std::cerr << "Warning: Could not load scale_inv " << weight_name
-                      << " in " << file_name << std::endl;
+            converted_data = tensor_data;
           }
-        } else {
-          std::vector<float> weight_data = load_tensor<float>(
-              safetensor_file_path, weight_name, weight_shape);
-          if (!weight_data.empty()) {
-            float_weights[weight_name] =
-                std::make_tuple(weight_data, weight_shape);
-          } else {
-            std::cerr << "Warning: Could not load float weight " << weight_name
-                      << " in " << file_name << std::endl;
-          }
+          combined_data[global_tensor_name] = {converted_data, shape};
+          new_metadata_json[global_tensor_name] = {
+              {"dtype", target_dtype},
+              {"shape", shape},
+              {"data_offsets",
+               {current_offset, current_offset + converted_data.size()}}};
+          current_offset += converted_data.size();
         }
       }
     }
-  }
-  std::cout << "begin dequantize " << fp8_weights.size() << " weight data..."
-            << std::endl;
-  std::map<std::string, std::pair<std::vector<char>, std::vector<long long>>>
-      combined_data;
-  nlohmann::json new_metadata_json;
-  new_metadata_json["__metadata__"] = {{"format", "pt"}};
-  uint64_t current_offset = 0;
-  int dequant_weight_counter = 0;
-  for (const auto &[weight_name, fp8_tuple] : fp8_weights) {
-    update_progress((dequant_weight_counter++) * 100 / fp8_weights.size());
-    if (scale_inv_weights.count(weight_name)) {
-      const auto &[quantized_data, weight_shape] = fp8_tuple;
-      const auto &[scale_inv_data, scale_shape] =
-          scale_inv_weights.at(weight_name);
-      long long M = 0;
-      long long N = 0;
-      if (weight_shape.size() == 2) {
-        M = weight_shape[0];
-        N = weight_shape[1];
-        std::vector<bfloat16> bf16_data =
-            weight_dequant_cpu(quantized_data, scale_inv_data, M, N);
-        size_t data_size = bf16_data.size() * sizeof(bfloat16);
-        std::vector<char> char_data(
-            reinterpret_cast<const char *>(bf16_data.data()),
-            reinterpret_cast<const char *>(bf16_data.data()) + data_size);
-        combined_data[weight_name] = {char_data, weight_shape};
-        new_metadata_json[weight_name] = {
-            {"dtype", "BF16"},
-            {"shape", weight_shape},
-            {"data_offsets", {current_offset, current_offset + data_size}}};
-        current_offset += data_size;
-      } else {
-        std::cerr << "Warning: FP8 weight " << weight_name
-                  << " is not 2D, skipping dequantization." << std::endl;
-      }
-    } else {
-      std::cerr << "Warning: Missing scale_inv for FP8 weight " << weight_name
-                << std::endl;
-    }
+    infile.close();
   }
 
-  for (const auto &[weight_name, float_tuple] : float_weights) {
-    const auto &[float_data, weight_shape] = float_tuple;
-    std::vector<bfloat16> bf16_data(float_data.size());
-    for (size_t i = 0; i < float_data.size(); ++i) {
-      bf16_data[i] = float_to_bfloat16(float_data[i]);
-    }
-    size_t data_size = bf16_data.size() * sizeof(bfloat16);
-    std::vector<char> char_data(
-        reinterpret_cast<const char *>(bf16_data.data()),
-        reinterpret_cast<const char *>(bf16_data.data()) + data_size);
-    combined_data[weight_name] = {char_data, weight_shape};
-    new_metadata_json[weight_name] = {
-        {"dtype", "BF16"},
-        {"shape", weight_shape},
-        {"data_offsets", {current_offset, current_offset + data_size}}};
-    current_offset += data_size;
-  }
+  std::string metadata_str = new_metadata_json.dump();
+  uint64_t metadata_len = metadata_str.length();
 
   std::string output_file_path = bf16_path + "/model.safetensors";
   std::ofstream outfile(output_file_path, std::ios::binary);
@@ -345,19 +327,18 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  std::string metadata_str = new_metadata_json.dump();
-  uint64_t metadata_len = metadata_str.length();
-
   outfile.write(reinterpret_cast<const char *>(&metadata_len),
                 sizeof(metadata_len));
   outfile.write(metadata_str.data(), metadata_len);
-  std::cout << "begin write " << combined_data.size() << " weight data..."
-            << std::endl;
-  int write_weight_counter = 0;
+  std::cout << "Writing combined tensor data..." << std::endl;
+  uint64_t written_bytes = 0;
   for (const auto &[_, data_pair] : combined_data) {
-    update_progress((write_weight_counter++) * 100 / combined_data.size());
     outfile.write(data_pair.first.data(), data_pair.first.size());
+    written_bytes += data_pair.first.size();
+    update_progress(static_cast<int>(
+        (static_cast<double>(written_bytes) / current_offset) * 100.0));
   }
+  std::cout << "\nFinished writing tensor data." << std::endl;
 
   outfile.close();
 
@@ -377,3 +358,4 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+
