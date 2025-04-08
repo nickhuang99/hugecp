@@ -36,6 +36,7 @@ Using this tool only when you have sufficient memory. i.e. I have no GPU, but hu
     ```
         -  Mar 24, 2025 now accept source as directory name which means all models under directory will be concatenated.
         -  Mar 26, 2025 add argument parsing option
+        -  Apr 8, 2025 add another tool q8_bf16.cpp. This is for converting `[fp8_cast_bf16.py](https://huggingface.co/deepseek-ai/DeepSeek-V3/tree/main/inference)` DeepSeek-R1 fp8 to bf16 dequantization with pure CPU. The provided DeepSeek python script requires GPU with very large GPU memory which is not available for me.
     
     ```
 
